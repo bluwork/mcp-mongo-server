@@ -156,6 +156,7 @@ const ADMIN_WINDOW_MS = 60000; // 1 minute
 // Resource limits to prevent exhaustion
 const MAX_MONITORING_DURATION = 300000; // 5 minutes max
 const MAX_SAMPLE_DURATION = 60000; // 1 minute max
+const MIN_MONITORING_INTERVAL = 500; // 500ms minimum interval
 
 function checkAdminRateLimit(operation: string): boolean {
   const now = Date.now();
@@ -1706,7 +1707,7 @@ async function main() {
         logToolUsage('getLiveMetrics', args);
         const requestedDuration = args.duration || 60000;
         const duration = Math.min(requestedDuration, MAX_MONITORING_DURATION);
-        const interval = Math.min(Math.max(args.interval || 1000, 500), duration / 2); // Minimum 500ms, maximum duration/2
+        const interval = Math.min(Math.max(args.interval || 1000, MIN_MONITORING_INTERVAL), duration / 2); // Minimum MIN_MONITORING_INTERVAL, maximum duration/2
         
         // Rate limiting check
         if (!checkAdminRateLimit('getLiveMetrics')) {
@@ -1833,7 +1834,7 @@ async function main() {
           // Monitor current operations for activity
           const operationCounts = new Map<string, number>();
           const startTime = Date.now();
-          const sampleInterval = Math.max(500, Math.floor(sampleDuration / 10)); // Sample 10 times or every 500ms
+          const sampleInterval = Math.max(MIN_MONITORING_INTERVAL, Math.floor(sampleDuration / 10)); // Sample 10 times or every MIN_MONITORING_INTERVAL
 
           // Sample operations over the duration with optimized interval
           let sampleCount = 0;
