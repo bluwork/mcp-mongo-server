@@ -265,12 +265,18 @@ const client = new MongoClient(uri);
 // Setup logging with validation
 const LOG_DIR = (() => {
   const logDir = process.env.LOG_DIR || './logs';
-  // Validate log directory path
+  // Validate log directory path: must not contain '..' or null bytes, and must be within the app base directory
   if (logDir.includes('..') || logDir.includes('\0')) {
     console.warn('Invalid LOG_DIR path, using default: ./logs');
     return './logs';
   }
-  return logDir;
+  const baseDir = process.cwd();
+  const resolvedLogDir = path.resolve(baseDir, logDir);
+  if (!resolvedLogDir.startsWith(baseDir + path.sep)) {
+    console.warn('LOG_DIR must be within the application directory. Using default: ./logs');
+    return path.join(baseDir, 'logs');
+  }
+  return resolvedLogDir;
 })();
 const TOOL_LOG_FILE = path.join(LOG_DIR, 'tool-usage.log');
 const ERROR_LOG_FILE = path.join(LOG_DIR, 'error.log');
