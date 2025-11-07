@@ -1835,7 +1835,7 @@ async function main() {
           // Monitor current operations for activity
           const operationCounts = new Map<string, number>();
           const startTime = Date.now();
-          const sampleInterval = Math.max(MIN_SAMPLE_INTERVAL, Math.floor(sampleDuration / SAMPLE_COUNT)); // Sample SAMPLE_COUNT times or every MIN_SAMPLE_INTERVAL ms
+          const sampleInterval = Math.max(MIN_SAMPLE_INTERVAL, Math.floor(sampleDuration / SAMPLE_COUNT)); // Sample at most SAMPLE_COUNT times with minimum interval of MIN_SAMPLE_INTERVAL ms
 
           // Sample operations over the duration with optimized interval
           let sampleCount = 0;
