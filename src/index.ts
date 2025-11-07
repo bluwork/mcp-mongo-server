@@ -1394,7 +1394,7 @@ async function main() {
           // Database operations
           'dropdatabase', 'repairdatabase',
           // Security risks
-          'eval', '$where', 'mapreduce',
+          'eval', 'mapreduce',
           // Replication & clustering (should be managed outside MCP)
           'replsetreconfig', 'replsetgetconfig', 'replsetinitiate', 'replsetfreeze',
           'replsetmaintenance', 'replsetstepdown', 'replsetsyncfrom',
