@@ -438,7 +438,16 @@ function validateMongoUri(uri: string): boolean {
     return false;
   }
   try {
-    new URL(uri.replace('mongodb+srv://', 'http://').replace('mongodb://', 'http://'));
+    // Replace MongoDB scheme with http for URL parsing
+    const httpUri = uri.replace('mongodb+srv://', 'http://').replace('mongodb://', 'http://');
+    const parsedUrl = new URL(httpUri);
+    
+    // Check that a host component is present and not empty
+    // hostname is empty for URLs like "http://" or "http://@"
+    if (!parsedUrl.hostname) {
+      return false;
+    }
+    
     return true;
   } catch {
     return false;
