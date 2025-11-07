@@ -156,6 +156,8 @@ const ADMIN_WINDOW_MS = 60000; // 1 minute
 // Resource limits to prevent exhaustion
 const MAX_MONITORING_DURATION = 300000; // 5 minutes max
 const MAX_SAMPLE_DURATION = 60000; // 1 minute max
+const MIN_SAMPLE_INTERVAL = 500; // Minimum time between samples in ms
+const SAMPLE_COUNT = 10; // Number of samples to take during monitoring
 
 function checkAdminRateLimit(operation: string): boolean {
   const now = Date.now();
@@ -1833,7 +1835,7 @@ async function main() {
           // Monitor current operations for activity
           const operationCounts = new Map<string, number>();
           const startTime = Date.now();
-          const sampleInterval = Math.max(500, Math.floor(sampleDuration / 10)); // Sample 10 times or every 500ms
+          const sampleInterval = Math.max(MIN_SAMPLE_INTERVAL, Math.floor(sampleDuration / SAMPLE_COUNT)); // Sample SAMPLE_COUNT times or every MIN_SAMPLE_INTERVAL ms
 
           // Sample operations over the duration with optimized interval
           let sampleCount = 0;
