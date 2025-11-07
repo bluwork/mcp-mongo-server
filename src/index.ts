@@ -438,7 +438,7 @@ function validateMongoUri(uri: string): boolean {
     
     // Check that a host component is present and not empty
     // hostname is empty for URLs like "http://" or "http://@"
-    if (!parsedUrl.hostname || parsedUrl.hostname.length === 0) {
+    if (!parsedUrl.hostname) {
       return false;
     }
     
