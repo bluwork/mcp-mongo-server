@@ -4,6 +4,7 @@ import { MongoClient, ObjectId } from 'mongodb';
 import { z } from 'zod';
 import { config } from 'dotenv';
 import fs from 'fs';
+import { promises as fsPromises } from 'fs';
 import path from 'path';
 
 // TypeScript interfaces for monitoring data structures
@@ -152,6 +153,10 @@ const adminOpLimiter = new Map<string, { count: number; resetTime: number }>();
 const ADMIN_RATE_LIMIT = 100; // requests per minute
 const ADMIN_WINDOW_MS = 60000; // 1 minute
 
+// Resource limits to prevent exhaustion
+const MAX_MONITORING_DURATION = 300000; // 5 minutes max
+const MAX_SAMPLE_DURATION = 60000; // 1 minute max
+
 function checkAdminRateLimit(operation: string): boolean {
   const now = Date.now();
   const key = operation;
@@ -172,76 +177,125 @@ function checkAdminRateLimit(operation: string): boolean {
 }
 
 // Security: Sanitize sensitive data from responses
+// Handles circular references, special objects (Date, ObjectId), and avoids deep cloning
 function sanitizeResponse(data: any): any {
   if (!data || typeof data !== 'object') {
     return data;
   }
-  
+
   const sensitiveFields = ['connectionString', 'password', 'key', 'secret', 'token'];
-  const sanitized = JSON.parse(JSON.stringify(data));
-  
-  function sanitizeObject(obj: any): void {
-    if (!obj || typeof obj !== 'object') return;
-    
+  const seen = new WeakSet(); // Track circular references
+
+  function sanitizeObject(obj: any): any {
+    if (!obj || typeof obj !== 'object') {
+      return obj;
+    }
+
+    // Handle circular references
+    if (seen.has(obj)) {
+      return '[Circular Reference]';
+    }
+    seen.add(obj);
+
+    // Handle special object types
+    if (obj instanceof Date) {
+      return obj.toISOString();
+    }
+    if (obj instanceof ObjectId) {
+      return obj.toString();
+    }
+    if (obj instanceof RegExp) {
+      return obj.toString();
+    }
+    if (Buffer.isBuffer(obj)) {
+      return '[Binary Data]';
+    }
+
+    // Handle arrays
+    if (Array.isArray(obj)) {
+      return obj.map((item) => sanitizeObject(item));
+    }
+
+    // Handle plain objects
+    const sanitized: any = {};
     for (const [key, value] of Object.entries(obj)) {
-      if (sensitiveFields.some(field => key.toLowerCase().includes(field))) {
-        obj[key] = '[REDACTED]';
-      } else if (typeof value === 'object' && value !== null) {
-        sanitizeObject(value);
+      if (sensitiveFields.some((field) => key.toLowerCase().includes(field))) {
+        sanitized[key] = '[REDACTED]';
+      } else {
+        sanitized[key] = sanitizeObject(value);
       }
     }
+
+    return sanitized;
   }
-  
-  sanitizeObject(sanitized);
-  return sanitized;
+
+  return sanitizeObject(data);
 }
 
 // Parse command line arguments
+// SECURITY: URI must come from environment variables only to avoid credential exposure in process list
 function parseArgs() {
   const args = process.argv.slice(2);
-  let uri = process.env.MONGODB_URI || 'mongodb://localhost:27017';
+  const uri = process.env.MONGODB_URI || 'mongodb://localhost:27017';
   let dbName = process.env.MONGODB_DB || 'test';
   let mode = process.env.SERVER_MODE || 'read-write'; // 'read-only' or 'read-write'
-  
+
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === '--read-only') {
       mode = 'read-only';
     } else if (arg === '--read-write') {
       mode = 'read-write';
-    } else if (arg === '--mode') {
-      mode = args[++i] || mode;
-    } else if (!uri || uri === 'mongodb://localhost:27017') {
-      uri = arg;
-    } else if (!dbName || dbName === 'test') {
+    } else if (arg === '--mode' && i + 1 < args.length) {
+      mode = args[++i];
+    } else if (arg === '--db' && i + 1 < args.length) {
+      dbName = args[++i];
+    } else if (!arg.startsWith('--')) {
+      // Accept database name as positional argument
       dbName = arg;
     }
   }
-  
+
   return { uri, dbName, mode };
 }
 
 const { uri, dbName, mode } = parseArgs();
 const client = new MongoClient(uri);
 
-// Setup logging
-const LOG_DIR = process.env.LOG_DIR || './logs';
+// Setup logging with validation
+const LOG_DIR = (() => {
+  const logDir = process.env.LOG_DIR || './logs';
+  // Validate log directory path
+  if (logDir.includes('..') || logDir.includes('\0')) {
+    console.warn('Invalid LOG_DIR path, using default: ./logs');
+    return './logs';
+  }
+  return logDir;
+})();
 const TOOL_LOG_FILE = path.join(LOG_DIR, 'tool-usage.log');
 const ERROR_LOG_FILE = path.join(LOG_DIR, 'error.log');
 
 // Ensure log directory exists
-if (!fs.existsSync(LOG_DIR)) {
-  fs.mkdirSync(LOG_DIR, { recursive: true });
+try {
+  if (!fs.existsSync(LOG_DIR)) {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+  }
+} catch (error) {
+  console.error(`Failed to create log directory ${LOG_DIR}:`, error instanceof Error ? error.message : String(error));
+  console.warn('Logging to files will be disabled');
 }
 
-// Logging functions
+// Logging functions - async to avoid blocking the event loop
 function logToolUsage(toolName: string, args: any, callerInfo?: string) {
   const timestamp = new Date().toISOString();
   const logEntry = `[${timestamp}] TOOL CALLED: ${toolName}\nArgs: ${JSON.stringify(args, null, 2)}\nCaller: ${
     callerInfo || 'Unknown'
   }\n-------------------\n`;
 
-  fs.appendFileSync(TOOL_LOG_FILE, logEntry);
+  // Fire and forget - don't await to avoid blocking
+  fsPromises.appendFile(TOOL_LOG_FILE, logEntry).catch((err) => {
+    console.error('Failed to write tool log:', err.message);
+  });
   console.log(`Tool called: ${toolName}`);
 }
 
@@ -256,7 +310,10 @@ function logError(toolName: string, error: any, args?: any) {
     2,
   )}\n-------------------\n`;
 
-  fs.appendFileSync(ERROR_LOG_FILE, logEntry);
+  // Fire and forget - don't await to avoid blocking
+  fsPromises.appendFile(ERROR_LOG_FILE, logEntry).catch((err) => {
+    console.error('Failed to write error log:', err.message);
+  });
   console.error(`Error in tool ${toolName}: ${errorMessage}`);
 }
 
@@ -358,14 +415,64 @@ function preprocessQueryValue(value: any, fieldName?: string): any {
   return processed;
 }
 
+// Connection health check
+async function checkConnection(): Promise<boolean> {
+  try {
+    await client.db('admin').command({ ping: 1 });
+    return true;
+  } catch (error) {
+    console.error('Connection health check failed:', error instanceof Error ? error.message : String(error));
+    return false;
+  }
+}
+
+// Validate MongoDB URI format
+function validateMongoUri(uri: string): boolean {
+  if (!uri.startsWith('mongodb://') && !uri.startsWith('mongodb+srv://')) {
+    return false;
+  }
+  try {
+    new URL(uri.replace('mongodb+srv://', 'http://').replace('mongodb://', 'http://'));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Main function
 async function main() {
+  // Validate MongoDB URI before attempting connection
+  if (!validateMongoUri(uri)) {
+    console.error('Invalid MongoDB URI format. URI must start with mongodb:// or mongodb+srv://');
+    process.exit(1);
+  }
+
   try {
     await client.connect();
     console.log('Connected to MongoDB successfully');
     console.log(`Using database: ${dbName}`);
     console.log(`Server mode: ${mode}`);
     const db = client.db(dbName);
+
+    // Verify connection health
+    const isHealthy = await checkConnection();
+    if (!isHealthy) {
+      console.warn('Initial connection health check failed, but proceeding...');
+    }
+
+    // Set up periodic health checks (every 30 seconds)
+    setInterval(async () => {
+      const healthy = await checkConnection();
+      if (!healthy) {
+        console.error('Connection lost. Attempting to reconnect...');
+        try {
+          await client.connect();
+          console.log('Reconnected successfully');
+        } catch (e) {
+          console.error('Reconnection failed:', e instanceof Error ? e.message : String(e));
+        }
+      }
+    }, 30000);
 
     // Create and configure the MCP server
     const server = new McpServer({ 
@@ -1280,19 +1387,31 @@ async function main() {
           };
         }
         
-        // Security: Block dangerous commands
+        // Security: Block dangerous commands that could compromise security or stability
         const dangerousCommands = [
-          'shutdown', 'fsync', 'dropDatabase', 'eval', 'geoNear',
-          'mapReduce', 'copydb', 'clone', 'copydbgetnonce', 'planCacheClear'
+          // System control
+          'shutdown', 'fsync', 'killop', 'setparameter', 'setfeaturecompatibilityversion',
+          // Database operations
+          'dropdatabase', 'repairdatabase',
+          // Security risks
+          'eval', '$where', 'mapreduce',
+          // Replication & clustering (should be managed outside MCP)
+          'replsetreconfig', 'replsetgetconfig', 'replsetinitiate', 'replsetfreeze',
+          'replsetmaintenance', 'replsetstepdown', 'replsetsyncfrom',
+          // Deprecated/dangerous
+          'geonear', 'copydb', 'clone', 'copydbgetnonce', 'plancacheclear',
+          // User management (should use dedicated admin tools)
+          'createuser', 'dropuser', 'dropallusersfromdatabase', 'updaterole',
+          'grantroletouser', 'revokerolefromuser'
         ];
-        
+
         const commandName = Object.keys(command)[0]?.toLowerCase();
         if (dangerousCommands.includes(commandName)) {
           return {
             content: [
               {
                 type: 'text',
-                text: `Command '${commandName}' is not allowed for security reasons.`,
+                text: `Command '${commandName}' is not allowed for security reasons. Use dedicated admin tools for this operation.`,
               },
             ],
           };
@@ -1579,7 +1698,9 @@ async function main() {
       },
       async (args) => {
         logToolUsage('getLiveMetrics', args);
-        const { duration = 60000, interval = 1000 } = args;
+        const requestedDuration = args.duration || 60000;
+        const duration = Math.min(requestedDuration, MAX_MONITORING_DURATION);
+        const interval = Math.max(args.interval || 1000, 500); // Minimum 500ms interval
         
         // Rate limiting check
         if (!checkAdminRateLimit('getLiveMetrics')) {
@@ -1690,59 +1811,55 @@ async function main() {
       },
       async (args) => {
         logToolUsage('getHottestCollections', args);
-        const { limit = 10, sampleDuration = 5000 } = args;
+        const limit = Math.min(args.limit || 10, 100); // Max 100 collections
+        const requestedSampleDuration = args.sampleDuration || 5000;
+        const sampleDuration = Math.min(requestedSampleDuration, MAX_SAMPLE_DURATION);
         
         try {
           // Get all collections
           const collections = await db.listCollections().toArray();
+          const collectionNames = new Set(collections.map(c => c.name));
           const collectionStats: any[] = [];
-          
+
           // Get initial server status for operation counts
           const initialStatus = await db.admin().command({ serverStatus: 1 });
-          
-          // Get initial collection stats
-          const initialCollectionOps = new Map<string, any>();
-          for (const coll of collections) {
-            try {
-              const stats = await db.command({ 
-                collStats: coll.name,
-                indexDetails: false 
-              });
-              initialCollectionOps.set(coll.name, {
-                operations: stats.wiredTiger?.cursor?.['insert calls'] || 0 +
-                           stats.wiredTiger?.cursor?.['update calls'] || 0 +
-                           stats.wiredTiger?.cursor?.['remove calls'] || 0,
-                stats
-              });
-            } catch (e) {
-              // Collection might have been dropped
-              continue;
-            }
-          }
-          
+
           // Monitor current operations for activity
           const operationCounts = new Map<string, number>();
           const startTime = Date.now();
-          
-          // Sample operations over the duration
+          const sampleInterval = Math.max(500, Math.floor(sampleDuration / 10)); // Sample 10 times or every 500ms
+
+          // Sample operations over the duration with optimized interval
+          let sampleCount = 0;
           while (Date.now() - startTime < sampleDuration) {
-            const currentOps = await db.admin().command({ 
-              currentOp: true, 
-              "$all": true 
-            });
-            
-            // Count operations per collection
-            currentOps.inprog.forEach((op: any) => {
-              if (op.ns && op.active) {
-                const collName = op.ns.split('.').slice(1).join('.');
-                if (collName) {
-                  operationCounts.set(collName, (operationCounts.get(collName) || 0) + 1);
-                }
+            try {
+              const currentOps = await db.admin().command({
+                currentOp: true,
+                "$all": true
+              });
+
+              // Count operations per collection
+              if (currentOps.inprog && Array.isArray(currentOps.inprog)) {
+                currentOps.inprog.forEach((op: any) => {
+                  if (op.ns && op.active) {
+                    const parts = op.ns.split('.');
+                    if (parts.length > 1) {
+                      const collName = parts.slice(1).join('.');
+                      // Only count if collection still exists
+                      if (collName && collectionNames.has(collName)) {
+                        operationCounts.set(collName, (operationCounts.get(collName) || 0) + 1);
+                      }
+                    }
+                  }
+                });
               }
-            });
-            
-            // Small delay to avoid overwhelming the server
-            await new Promise(resolve => setTimeout(resolve, 100));
+
+              sampleCount++;
+              await new Promise(resolve => setTimeout(resolve, sampleInterval));
+            } catch (e) {
+              // Ignore errors during sampling and continue
+              await new Promise(resolve => setTimeout(resolve, sampleInterval));
+            }
           }
           
           // Get final server status
@@ -1752,30 +1869,36 @@ async function main() {
                           (initialStatus.opcounters.insert + initialStatus.opcounters.query + 
                            initialStatus.opcounters.update + initialStatus.opcounters.delete);
           
-          // Compile collection activity data
+          // Compile collection activity data - only for collections that still exist
           for (const coll of collections) {
+            // Skip if collection was dropped during sampling
+            if (!collectionNames.has(coll.name)) {
+              continue;
+            }
+
             try {
-              const stats = await db.command({ 
+              const stats = await db.command({
                 collStats: coll.name,
-                indexDetails: false 
+                indexDetails: false
               });
-              
+
               const activeOps = operationCounts.get(coll.name) || 0;
               const percentage = totalOps > 0 ? (activeOps / totalOps) * 100 : 0;
-              
+
               collectionStats.push({
                 collection: coll.name,
                 namespace: `${db.databaseName}.${coll.name}`,
                 activeOperations: activeOps,
                 percentageOfTotal: parseFloat(percentage.toFixed(2)),
-                size: stats.size,
-                count: stats.count,
-                avgObjSize: stats.avgObjSize,
-                indexes: stats.nindexes,
+                size: stats.size || 0,
+                count: stats.count || 0,
+                avgObjSize: stats.avgObjSize || 0,
+                indexes: stats.nindexes || 0,
                 readWriteRatio: 'N/A' // Would need profiling data for accurate R/W ratio
               });
             } catch (e) {
-              // Collection might have been dropped
+              // Collection might have been dropped during sampling - skip it
+              collectionNames.delete(coll.name);
               continue;
             }
           }
@@ -1977,14 +2100,16 @@ async function main() {
           };
           
           // Check if profiling is enabled and get profiled operations
+          let profilingWasDisabled = false;
           try {
             const profileStatus = await db.admin().command({ profile: -1 });
             result.profilingStatus = profileStatus;
-            
+
             if (profileStatus.was === 0) {
               // Try to enable profiling temporarily if not enabled
               try {
                 await db.admin().command({ profile: 1, slowms: minDuration });
+                profilingWasDisabled = true;
                 result.profilingStatus = { was: 1, slowms: minDuration, enabled: 'temporarily' };
               } catch (e) {
                 // User might not have permission to enable profiling
@@ -2018,8 +2143,17 @@ async function main() {
           } catch (e) {
             result.profiledOperations = [];
             result.profilingStatus = { error: 'Could not access profiler data' };
+          } finally {
+            // Disable profiling if we enabled it temporarily
+            if (profilingWasDisabled) {
+              try {
+                await db.admin().command({ profile: 0 });
+              } catch (e) {
+                // Ignore errors when disabling profiling
+              }
+            }
           }
-          
+
           // Get currently running slow operations
           if (includeRunning) {
             const currentOps = await db.admin().command({ 

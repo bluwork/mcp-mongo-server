@@ -10,7 +10,8 @@
     "dev": "ts-node --esm src/index.ts",
     "watch": "ts-node-dev --respawn --transpile-only src/index.ts",
     "prepublish": "npm run build",
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "echo \"Install vitest to run tests: npm install --save-dev vitest\"",
+    "test:run": "vitest",
     "prepare": "chmod +x bin/cli.js"
   },
   "bin": {
