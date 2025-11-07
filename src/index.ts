@@ -1706,7 +1706,7 @@ async function main() {
         logToolUsage('getLiveMetrics', args);
         const requestedDuration = args.duration || 60000;
         const duration = Math.min(requestedDuration, MAX_MONITORING_DURATION);
-        const interval = Math.max(args.interval || 1000, 500); // Minimum 500ms interval
+        const interval = Math.min(Math.max(args.interval || 1000, 500), duration / 2); // Minimum 500ms, maximum duration/2
         
         // Rate limiting check
         if (!checkAdminRateLimit('getLiveMetrics')) {
