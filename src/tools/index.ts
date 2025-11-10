@@ -1,0 +1,23 @@
+import type { Db, MongoClient } from 'mongodb';
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { registerDatabaseTools } from './database.js';
+import { registerCollectionTools } from './collection.js';
+import { registerDocumentTools } from './document.js';
+import { registerSchemaTools } from './schema.js';
+import { registerMonitoringTools } from './monitoring.js';
+import { registerLiveMonitoringTools } from './live-monitoring.js';
+
+export function registerAllTools(
+  server: McpServer,
+  client: MongoClient,
+  db: Db,
+  dbName: string,
+  mode: string
+): void {
+  registerDatabaseTools(server, client, mode);
+  registerCollectionTools(server, db, mode);
+  registerDocumentTools(server, db, mode);
+  registerSchemaTools(server, db);
+  registerMonitoringTools(server, client, db, dbName, mode);
+  registerLiveMonitoringTools(server, db, mode);
+}
