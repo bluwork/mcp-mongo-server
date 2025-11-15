@@ -8,6 +8,7 @@ import { registerMonitoringTools } from './monitoring.js';
 import { registerLiveMonitoringTools } from './live-monitoring.js';
 import { registerIndexManagementTools } from './index-management.js';
 import { registerAdvancedOperations } from './advanced-operations.js';
+import { registerDataQualityTools } from './data-quality.js';
 
 export function registerAllTools(
   server: McpServer,
@@ -22,6 +23,7 @@ export function registerAllTools(
   registerSchemaTools(server, db);
   registerIndexManagementTools(server, db, mode);
   registerAdvancedOperations(server, db, mode);
+  registerDataQualityTools(server, db, mode);
   registerMonitoringTools(server, client, db, dbName, mode);
   registerLiveMonitoringTools(server, db, mode);
 }

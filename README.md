@@ -1,6 +1,6 @@
-# MongoDB MCP Server
+# Mongo Scout MCP
 
-MongoDB Model Context Protocol server for AI assistants and development tools.
+Scout your MongoDB databases with AI - A production-ready Model Context Protocol server with built-in safety features, live monitoring, and data quality tools.
 
 ## Setup
 
@@ -34,7 +34,9 @@ pnpm watch
 ## Command Line Usage
 
 ```
-mongodb-mcp [options] [mongodb-uri] [database-name]
+mongo-scout-mcp [options] [mongodb-uri] [database-name]
+# or use the shorter alias:
+mongo-scout [options] [mongodb-uri] [database-name]
 ```
 
 ### Server Modes
@@ -66,16 +68,16 @@ The server supports two modes with **read-only as the default** for safety:
 
 ```bash
 # Default read-only mode (safest)
-mongodb-mcp
+mongo-scout-mcp
 
 # Explicitly enable read-write mode (use with caution)
-mongodb-mcp --read-write
+mongo-scout-mcp --read-write
 
 # With custom URI and database in read-only mode
-mongodb-mcp mongodb://localhost:27017 mydb
+mongo-scout mongodb://localhost:27017 mydb
 
 # Read-write mode with custom connection
-mongodb-mcp --read-write mongodb://localhost:27017 mydb
+mongo-scout --read-write mongodb://localhost:27017 mydb
 ```
 
 ### Recommended Setup: Separate MCP Instances
@@ -87,12 +89,12 @@ The best practice is to configure **two separate MCP server instances** in your 
 ```json
 {
   "mcpServers": {
-    "mongodb-readonly": {
-      "command": "mongodb-mcp",
+    "mongo-scout-readonly": {
+      "command": "mongo-scout",
       "args": ["--read-only", "mongodb://localhost:27017", "mydb"]
     },
-    "mongodb-readwrite": {
-      "command": "mongodb-mcp",
+    "mongo-scout-readwrite": {
+      "command": "mongo-scout",
       "args": ["--read-write", "mongodb://localhost:27017", "mydb_dev"]
     }
   }
@@ -100,8 +102,8 @@ The best practice is to configure **two separate MCP server instances** in your 
 ```
 
 This approach gives you:
-- **mongodb-readonly**: Safe exploration without risk of data modification
-- **mongodb-readwrite**: Write operations available when explicitly needed
+- **mongo-scout-readonly**: Safe exploration without risk of data modification
+- **mongo-scout-readwrite**: Write operations available when explicitly needed
 - Clear separation of capabilities - AI assistants will see them as different tools
 - Option to point read-write to a development database for extra safety
 
@@ -142,7 +144,7 @@ This will show you live updates as external AIs interact with your server.
 
 ## Available Tools
 
-The MongoDB MCP server provides these tools:
+Mongo Scout MCP provides comprehensive MongoDB tools with a focus on safety and data quality:
 
 ### Read Operations (available in both modes):
 - **Database Operations**: `listDatabases`, `getDatabaseStats`
@@ -151,10 +153,15 @@ The MongoDB MCP server provides these tools:
 - **Schema Operations**: `inferSchema`
 
 ### Write Operations (only available in read-write mode):
-- **Collection Operations**: `createCollection`, `dropCollection`
+- **Collection Operations**: `createCollection`, `dropCollection`, `cloneCollection`
 - **Document Modification**: `updateOne`, `updateMany`, `replaceOne`, `findOneAndUpdate`
 - **Document Creation**: `insertOne`, `insertMany`
 - **Document Deletion**: `deleteOne`, `deleteMany`
+
+### Data Quality & Export Tools (NEW in v1.2.0):
+- **Duplicate Detection**: `findDuplicates` - Find duplicate documents based on field combinations
+- **Collection Cloning**: `cloneCollection` - Clone collections with filtering and index copying
+- **Data Export**: `exportCollection` - Export data to JSON, JSONL, or CSV formats
 
 ### Monitoring Operations (available in both modes):
 - **Server Monitoring**: `getServerStatus`, `runAdminCommand`
@@ -196,7 +203,7 @@ insertOne({ collection: "products", document: { name: "Widget", price: 9.99 } })
 inferSchema({ collection: "customers", sampleSize: 50 })
 ```
 
-### Live Monitoring Operations (NEW):
+### Live Monitoring Operations:
 ```
 // Monitor real-time metrics for 30 seconds with 1-second intervals
 getLiveMetrics({ duration: 30000, interval: 1000 })
@@ -209,6 +216,64 @@ getCollectionMetrics({ collection: "orders" })
 
 // Find operations taking more than 100ms
 getSlowestOperations({ minDuration: 100, limit: 10, includeRunning: true })
+```
+
+### Data Quality & Export Operations (NEW):
+```
+// Find duplicate emails in users collection
+findDuplicates({
+  collection: "users",
+  fields: ["email"],
+  options: { limit: 100, includeDocuments: true }
+})
+
+// Find duplicates based on multiple fields
+findDuplicates({
+  collection: "companies",
+  fields: ["name", "country"],
+  options: { minCount: 3 }
+})
+
+// Clone collection with filtering (supports dryRun)
+cloneCollection({
+  source: "users",
+  destination: "users_backup",
+  options: {
+    filter: { status: "active" },
+    includeIndexes: true,
+    dryRun: true  // Preview before executing
+  }
+})
+
+// Export to JSON
+exportCollection({
+  collection: "products",
+  options: {
+    format: "json",
+    filter: { category: "electronics" },
+    limit: 1000,
+    pretty: true
+  }
+})
+
+// Export to CSV with flattened nested objects
+exportCollection({
+  collection: "orders",
+  options: {
+    format: "csv",
+    projection: { orderNumber: 1, total: 1, customer: 1 },
+    flatten: true
+  }
+})
+
+// Export to JSONL (one document per line, streaming-friendly)
+exportCollection({
+  collection: "logs",
+  options: {
+    format: "jsonl",
+    filter: { level: "error", date: { $gte: "2025-01-01" } }
+  }
+})
 ```
 
 ## License
