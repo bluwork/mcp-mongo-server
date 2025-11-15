@@ -2,6 +2,8 @@ import type { Db } from 'mongodb';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { logToolUsage, logError } from '../utils/logger.js';
+import { filterCollectionStats, excludeZeroMetrics } from '../utils/response-filter.js';
+import type { VerbosityLevel } from '../types.js';
 
 export function registerCollectionTools(server: McpServer, db: Db, mode: string): void {
   const registerTool = (toolName: string, description: string, schema: any, handler: (args?: any) => any, writeOperation = false) => {
@@ -102,20 +104,31 @@ export function registerCollectionTools(server: McpServer, db: Db, mode: string)
 
   registerTool(
     'getCollectionStats',
-    'Get statistics for a collection',
+    'Get statistics for a collection. Use verbosity to control detail level (summary=most efficient, full=includes WiredTiger internals).',
     {
       collection: z.string(),
+      verbosity: z.enum(['summary', 'standard', 'full']).optional(),
+      excludeZeroMetrics: z.boolean().optional(),
     },
     async (args) => {
       logToolUsage('getCollectionStats', args);
-      const { collection } = args;
+      const { collection, verbosity = 'summary', excludeZeroMetrics: excludeZero = true } = args;
       try {
         const stats = await db.command({ collStats: collection });
+
+        // Filter based on verbosity level
+        let filtered = filterCollectionStats(stats as Record<string, unknown>, verbosity as VerbosityLevel);
+
+        // Optionally exclude zero metrics
+        if (excludeZero) {
+          filtered = excludeZeroMetrics(filtered as Record<string, unknown>);
+        }
+
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(stats, null, 2),
+              text: JSON.stringify(filtered, null, 2),
             },
           ],
         };

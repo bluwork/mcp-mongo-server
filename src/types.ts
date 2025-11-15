@@ -323,3 +323,5 @@ export type InferredSchema = Record<string, SchemaField>;
 export interface ToolHandler<TArgs = unknown, TResult = unknown> {
   (args: TArgs): Promise<TResult>;
 }
+
+export type VerbosityLevel = 'summary' | 'standard' | 'full';

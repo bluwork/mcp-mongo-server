@@ -16,6 +16,7 @@ import type {
   CurrentOpCommand,
   CurrentOpResult
 } from '../types.js';
+import { filterSlowOperation } from '../utils/response-filter.js';
 
 export function registerLiveMonitoringTools(server: McpServer, db: Db, mode: string): void {
   const registerTool = (toolName: string, description: string, schema: any, handler: (args?: any) => any, writeOperation = false) => {
@@ -27,14 +28,15 @@ export function registerLiveMonitoringTools(server: McpServer, db: Db, mode: str
 
   registerTool(
     'getLiveMetrics',
-    'Get real-time performance metrics with continuous updates',
+    'Get real-time performance metrics with continuous updates. Use includeRawSamples=false to get just the summary for token efficiency.',
     {
       duration: z.number().positive().optional(),
       interval: z.number().positive().optional(),
+      includeRawSamples: z.boolean().optional(),
     },
     async (args) => {
       logToolUsage('getLiveMetrics', args);
-      const { duration = 60000, interval = 1000 } = args;
+      const { duration = 60000, interval = 1000, includeRawSamples = false } = args;
 
       if (!checkAdminRateLimit('getLiveMetrics')) {
         return {
@@ -106,17 +108,23 @@ export function registerLiveMonitoringTools(server: McpServer, db: Db, mode: str
           avgMemoryMB: metrics.reduce((sum, m) => sum + m.memory.resident, 0) / metrics.length
         };
 
+        const response: Record<string, unknown> = {
+          duration,
+          interval,
+          samples: metrics.length,
+          summary
+        };
+
+        // Only include raw samples if requested (can be very verbose)
+        if (includeRawSamples) {
+          response.metrics = metrics;
+        }
+
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify({
-                duration,
-                interval,
-                samples: metrics.length,
-                summary,
-                metrics
-              }, null, 2),
+              text: JSON.stringify(response, null, 2),
             },
           ],
         };
@@ -258,13 +266,14 @@ export function registerLiveMonitoringTools(server: McpServer, db: Db, mode: str
 
   registerTool(
     'getCollectionMetrics',
-    'Get detailed performance metrics for a specific collection',
+    'Get detailed performance metrics for a specific collection. Use includeWiredTiger=false for token efficiency.',
     {
       collection: z.string(),
+      includeWiredTiger: z.boolean().optional(),
     },
     async (args) => {
       logToolUsage('getCollectionMetrics', args);
-      const { collection } = args;
+      const { collection, includeWiredTiger = false } = args;
 
       try {
         // Try with indexDetails first, fall back without it for MongoDB 8.0+
@@ -378,9 +387,13 @@ export function registerLiveMonitoringTools(server: McpServer, db: Db, mode: str
               breakdown: operationCounts
             },
             ratesPerSecond: opsPerSecond
-          },
-          wiredTiger: stats.wiredTiger || null
+          }
         };
+
+        // Only include WiredTiger stats if requested (can be very verbose)
+        if (includeWiredTiger) {
+          (metrics as Record<string, unknown>).wiredTiger = stats.wiredTiger || null;
+        }
 
         return {
           content: [
@@ -407,15 +420,16 @@ export function registerLiveMonitoringTools(server: McpServer, db: Db, mode: str
 
   registerTool(
     'getSlowestOperations',
-    'Get slow operations from both profiler and currently running operations',
+    'Get slow operations from both profiler and currently running operations. Use includeQueryDetails=false for token efficiency.',
     {
       minDuration: z.number().min(0).optional(),
       limit: z.number().positive().optional(),
       includeRunning: z.boolean().optional(),
+      includeQueryDetails: z.boolean().optional(),
     },
     async (args) => {
       logToolUsage('getSlowestOperations', args);
-      const { minDuration = 100, limit = 10, includeRunning = true } = args;
+      const { minDuration = 100, limit = 10, includeRunning = true, includeQueryDetails = false } = args;
 
       try {
         const result: {
@@ -531,6 +545,13 @@ export function registerLiveMonitoringTools(server: McpServer, db: Db, mode: str
           namespaces: [...new Set(allOperations.map(op => op.namespace))].slice(0, 10)
         };
 
+        // Filter operations based on includeQueryDetails flag
+        const filteredOperations = includeQueryDetails
+          ? allOperations.slice(0, limit)
+          : allOperations.slice(0, limit).map(op =>
+              filterSlowOperation(op as unknown as Record<string, unknown>, includeQueryDetails) as unknown as SlowOperation
+            );
+
         return {
           content: [
             {
@@ -538,7 +559,7 @@ export function registerLiveMonitoringTools(server: McpServer, db: Db, mode: str
               text: JSON.stringify({
                 summary,
                 profilingStatus: result.profilingStatus,
-                operations: allOperations.slice(0, limit)
+                operations: filteredOperations
               }, null, 2),
             },
           ],

@@ -4,7 +4,8 @@ import { z } from 'zod';
 import { logToolUsage, logError } from '../utils/logger.js';
 import { checkAdminRateLimit, ADMIN_RATE_LIMIT } from '../utils/rate-limiter.js';
 import { sanitizeResponse } from '../utils/sanitize.js';
-import type { CurrentOpCommand, CurrentOpResult, ServerStatus } from '../types.js';
+import type { CurrentOpCommand, CurrentOpResult, ServerStatus, VerbosityLevel } from '../types.js';
+import { filterServerStatus, filterDatabaseStats, filterProfilerEntry, excludeZeroMetrics } from '../utils/response-filter.js';
 
 export function registerMonitoringTools(server: McpServer, client: MongoClient, db: Db, dbName: string, mode: string): void {
   const registerTool = (toolName: string, description: string, schema: any, handler: (args?: any) => any, writeOperation = false) => {
@@ -16,14 +17,25 @@ export function registerMonitoringTools(server: McpServer, client: MongoClient, 
 
   registerTool(
     'getServerStatus',
-    'Get comprehensive server status and performance metrics',
+    'Get server status and performance metrics. Use includeWiredTiger/includeReplication/includeStorageEngine flags to control detail level for token efficiency.',
     {
       includeHost: z.boolean().optional(),
       includeMetrics: z.array(z.enum(['connections', 'opcounters', 'mem', 'network', 'globalLock', 'asserts'])).optional(),
+      includeWiredTiger: z.boolean().optional(),
+      includeReplication: z.boolean().optional(),
+      includeStorageEngine: z.boolean().optional(),
+      excludeZeroMetrics: z.boolean().optional(),
     },
     async (args) => {
       logToolUsage('getServerStatus', args);
-      const { includeHost = false, includeMetrics } = args;
+      const {
+        includeHost = false,
+        includeMetrics,
+        includeWiredTiger = false,
+        includeReplication = false,
+        includeStorageEngine = false,
+        excludeZeroMetrics: excludeZero = true
+      } = args;
 
       if (!checkAdminRateLimit('getServerStatus')) {
         return {
@@ -73,7 +85,19 @@ export function registerMonitoringTools(server: McpServer, client: MongoClient, 
           });
         }
 
-        const sanitizedStatus = sanitizeResponse(filteredStatus);
+        // Filter out DBA-level internals
+        let result = filterServerStatus(filteredStatus, {
+          includeWiredTiger,
+          includeReplication,
+          includeStorageEngine
+        });
+
+        // Optionally exclude zero metrics
+        if (excludeZero) {
+          result = excludeZeroMetrics(result as Record<string, unknown>);
+        }
+
+        const sanitizedStatus = sanitizeResponse(result);
 
         return {
           content: [
@@ -100,18 +124,26 @@ export function registerMonitoringTools(server: McpServer, client: MongoClient, 
 
   registerTool(
     'getDatabaseStats',
-    'Get comprehensive database statistics and storage metrics',
+    'Get database statistics and storage metrics. Use verbosity to control detail level (summary=most efficient).',
     {
       database: z.string().optional(),
       scale: z.number().positive().optional(),
       indexDetails: z.boolean().optional(),
+      verbosity: z.enum(['summary', 'standard', 'full']).optional(),
+      excludeZeroMetrics: z.boolean().optional(),
     },
     async (args) => {
       logToolUsage('getDatabaseStats', args);
-      const { database = dbName, scale = 1, indexDetails = false } = args;
+      const {
+        database = dbName,
+        scale = 1,
+        indexDetails = false,
+        verbosity = 'summary',
+        excludeZeroMetrics: excludeZero = true
+      } = args;
       try {
         const targetDb = client.db(database);
-        const commandOptions: any = {
+        const commandOptions: Record<string, unknown> = {
           dbStats: 1,
           scale: scale
         };
@@ -121,11 +153,19 @@ export function registerMonitoringTools(server: McpServer, client: MongoClient, 
         }
         const stats = await targetDb.command(commandOptions);
 
+        // Filter based on verbosity level
+        let filtered = filterDatabaseStats(stats as Record<string, unknown>, verbosity as VerbosityLevel);
+
+        // Optionally exclude zero metrics
+        if (excludeZero) {
+          filtered = excludeZeroMetrics(filtered as Record<string, unknown>);
+        }
+
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(stats, null, 2),
+              text: JSON.stringify(filtered, null, 2),
             },
           ],
         };
@@ -373,12 +413,13 @@ export function registerMonitoringTools(server: McpServer, client: MongoClient, 
 
   registerTool(
     'getProfilerStats',
-    'Get database profiler statistics and slow operation data',
+    'Get database profiler statistics and slow operation data. Use verbosity to control detail level (summary=most efficient, excludes full query details).',
     {
       database: z.string().optional(),
       limit: z.number().positive().optional(),
       sort: z.record(z.number()).optional(),
       filter: z.record(z.any()).optional(),
+      verbosity: z.enum(['summary', 'standard', 'full']).optional(),
     },
     async (args) => {
       logToolUsage('getProfilerStats', args);
@@ -386,7 +427,8 @@ export function registerMonitoringTools(server: McpServer, client: MongoClient, 
         database = dbName,
         limit = 100,
         sort = { ts: -1 },
-        filter = {}
+        filter = {},
+        verbosity = 'summary'
       } = args;
       try {
         const targetDb = client.db(database);
@@ -414,14 +456,19 @@ export function registerMonitoringTools(server: McpServer, client: MongoClient, 
           .limit(limit)
           .toArray();
 
+        // Filter entries based on verbosity
+        const filteredEntries = profileData.map(entry =>
+          filterProfilerEntry(entry as Record<string, unknown>, verbosity as VerbosityLevel)
+        );
+
         return {
           content: [
             {
               type: 'text',
               text: JSON.stringify({
                 profileStatus: profileStatus,
-                entries: profileData,
-                count: profileData.length
+                entries: filteredEntries,
+                count: filteredEntries.length
               }, null, 2),
             },
           ],
