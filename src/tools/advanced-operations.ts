@@ -12,21 +12,145 @@ export function registerAdvancedOperations(server: McpServer, db: Db, mode: stri
     server.tool(toolName, description, schema, handler);
   };
 
+  // Preview bulk write operations
+  registerTool(
+    'previewBulkWrite',
+    'Preview what a bulkWrite operation would do without executing it',
+    {
+      collection: z.string(),
+      operations: z.array(z.record(z.any())),
+    },
+    async (args) => {
+      logToolUsage('previewBulkWrite', args);
+      const { collection, operations } = args;
+      try {
+        const operationsSummary = {
+          insertOne: 0,
+          updateOne: 0,
+          updateMany: 0,
+          deleteOne: 0,
+          deleteMany: 0,
+          replaceOne: 0
+        };
+
+        // Count operation types
+        operations.forEach((op: Record<string, any>) => {
+          Object.keys(op).forEach(opType => {
+            if (opType in operationsSummary) {
+              operationsSummary[opType as keyof typeof operationsSummary]++;
+            }
+          });
+        });
+
+        // Extract sample operations for each type
+        const samples: Record<string, any> = {};
+        for (const [opType, count] of Object.entries(operationsSummary)) {
+          if (count > 0) {
+            const sample = operations.find((op: Record<string, any>) => opType in op);
+            if (sample) {
+              samples[opType] = sample[opType];
+            }
+          }
+        }
+
+        const totalOps = operations.length;
+        let warning: string | undefined;
+        if (totalOps >= 1000) {
+          warning = '⚠⚠ LARGE BULK OPERATION: 1000+ operations';
+        } else if (totalOps >= 100) {
+          warning = '⚠ Large bulk operation: 100+ operations';
+        }
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                preview: true,
+                collection,
+                totalOperations: totalOps,
+                breakdown: operationsSummary,
+                sampleOperations: samples,
+                message: warning
+              }, null, 2),
+            },
+          ],
+        };
+      } catch (error) {
+        logError('previewBulkWrite', error, args);
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Error previewing bulk write: ${errorMessage}`,
+            },
+          ],
+        };
+      }
+    }
+  );
+
   registerTool(
     'bulkWrite',
-    'Execute multiple write operations in a single call',
+    'Execute multiple write operations in a single call. Supports dryRun mode for preview.',
     {
       collection: z.string(),
       operations: z.array(z.record(z.any())),
       options: z.object({
         ordered: z.boolean().optional(),
+        dryRun: z.boolean().optional(),
       }).optional(),
     },
     async (args) => {
       logToolUsage('bulkWrite', args);
       const { collection, operations, options = {} } = args;
       try {
-        const result = await db.collection(collection).bulkWrite(operations, options);
+        // Dry run mode - show what would be executed
+        if (options.dryRun) {
+          const operationsSummary = {
+            insertOne: 0,
+            updateOne: 0,
+            updateMany: 0,
+            deleteOne: 0,
+            deleteMany: 0,
+            replaceOne: 0
+          };
+
+          operations.forEach((op: Record<string, any>) => {
+            Object.keys(op).forEach(opType => {
+              if (opType in operationsSummary) {
+                operationsSummary[opType as keyof typeof operationsSummary]++;
+              }
+            });
+          });
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  dryRun: true,
+                  operation: 'bulkWrite',
+                  collection,
+                  totalOperations: operations.length,
+                  breakdown: operationsSummary,
+                  ordered: options.ordered ?? true,
+                  warning: operations.length > 100 ? '⚠ Large bulk operation detected' : undefined
+                }, null, 2),
+              },
+            ],
+          };
+        }
+
+        // Actual execution
+        const result = await db.collection(collection).bulkWrite(operations, {
+          ordered: options.ordered
+        });
+
+        const totalAffected = result.insertedCount + result.modifiedCount + result.deletedCount;
+        const warningText = totalAffected > 100 ? '\n⚠ Large bulk operation completed' : '';
+
         return {
           content: [
             {
@@ -38,7 +162,7 @@ export function registerAdvancedOperations(server: McpServer, db: Db, mode: stri
                 deletedCount: result.deletedCount,
                 upsertedCount: result.upsertedCount,
                 upsertedIds: result.upsertedIds,
-              }, null, 2),
+              }, null, 2) + warningText,
             },
           ],
         };

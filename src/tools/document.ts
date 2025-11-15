@@ -3,6 +3,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { logToolUsage, logError } from '../utils/logger.js';
 import { preprocessQuery } from '../utils/query-preprocessor.js';
+import { shouldBlockFilter, validateFilter, getOperationWarning } from '../utils/filter-validator.js';
 
 export function registerDocumentTools(server: McpServer, db: Db, mode: string): void {
   const registerTool = (toolName: string, description: string, schema: any, handler: (args?: any) => any, writeOperation = false) => {
@@ -191,6 +192,105 @@ export function registerDocumentTools(server: McpServer, db: Db, mode: string): 
     }
   );
 
+  // Preview operations (safety tools)
+  registerTool(
+    'previewUpdate',
+    'Preview which documents would be affected by an update operation without modifying data',
+    {
+      collection: z.string(),
+      filter: z.record(z.any()),
+      limit: z.number().positive().max(100).optional(),
+    },
+    async (args) => {
+      logToolUsage('previewUpdate', args);
+      const { collection, filter, limit = 3 } = args;
+      try {
+        const processedFilter = preprocessQuery(filter);
+        const validation = validateFilter(processedFilter);
+
+        const matchCount = await db.collection(collection).countDocuments(processedFilter);
+        const sampleDocs = await db.collection(collection).find(processedFilter).limit(limit).toArray();
+
+        const smartWarning = getOperationWarning(matchCount, 'update');
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                willAffect: matchCount,
+                sampleDocuments: sampleDocs,
+                samplesShown: sampleDocs.length,
+                message: smartWarning || (matchCount <= 10 ? `✓ Will update ${matchCount} document${matchCount !== 1 ? 's' : ''}` : undefined),
+                filterWarning: validation.warning,
+              }, null, 2),
+            },
+          ],
+        };
+      } catch (error) {
+        logError('previewUpdate', error, args);
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Error previewing update: ${errorMessage}`,
+            },
+          ],
+        };
+      }
+    }
+  );
+
+  registerTool(
+    'previewDelete',
+    'Preview which documents would be deleted without actually deleting them',
+    {
+      collection: z.string(),
+      filter: z.record(z.any()),
+      limit: z.number().positive().max(100).optional(),
+    },
+    async (args) => {
+      logToolUsage('previewDelete', args);
+      const { collection, filter, limit = 3 } = args;
+      try {
+        const processedFilter = preprocessQuery(filter);
+        const validation = validateFilter(processedFilter);
+
+        const deleteCount = await db.collection(collection).countDocuments(processedFilter);
+        const sampleDocs = await db.collection(collection).find(processedFilter).limit(limit).toArray();
+
+        const smartWarning = getOperationWarning(deleteCount, 'delete');
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                willDelete: deleteCount,
+                sampleDocuments: sampleDocs,
+                samplesShown: sampleDocs.length,
+                message: smartWarning || (deleteCount <= 10 ? `✓ Will delete ${deleteCount} document${deleteCount !== 1 ? 's' : ''}` : undefined),
+                filterWarning: validation.warning,
+              }, null, 2),
+            },
+          ],
+        };
+      } catch (error) {
+        logError('previewDelete', error, args);
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Error previewing delete: ${errorMessage}`,
+            },
+          ],
+        };
+      }
+    }
+  );
+
   // Insert operations
   registerTool(
     'insertOne',
@@ -310,13 +410,16 @@ export function registerDocumentTools(server: McpServer, db: Db, mode: string): 
 
   registerTool(
     'updateMany',
-    'Update multiple documents that match the filter',
+    'Update multiple documents that match the filter. Supports dryRun mode, empty filter protection, and maxDocuments limit.',
     {
       collection: z.string(),
       filter: z.record(z.any()),
       update: z.record(z.any()),
       options: z.object({
         upsert: z.boolean().optional(),
+        dryRun: z.boolean().optional(),
+        allowEmptyFilter: z.boolean().optional(),
+        maxDocuments: z.number().positive().optional(),
       }).optional(),
     },
     async (args) => {
@@ -324,13 +427,73 @@ export function registerDocumentTools(server: McpServer, db: Db, mode: string): 
       const { collection, filter, update, options = {} } = args;
       try {
         const processedFilter = preprocessQuery(filter);
-        const result = await db.collection(collection).updateMany(processedFilter, update, options);
+
+        // Check for empty filter safety
+        const filterCheck = shouldBlockFilter(processedFilter, options.allowEmptyFilter, 'Update');
+        if (filterCheck.blocked) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: filterCheck.reason,
+              },
+            ],
+          };
+        }
+
+        // Count documents that would be affected
+        const matchCount = await db.collection(collection).countDocuments(processedFilter);
+
+        // Check maxDocuments limit
+        if (options.maxDocuments && matchCount > options.maxDocuments) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `⚠ Operation blocked: Would affect ${matchCount.toLocaleString()} documents, exceeds maxDocuments limit of ${options.maxDocuments.toLocaleString()}
+
+Use previewUpdate() to see which documents would be affected
+Or increase maxDocuments limit if this is intentional`,
+              },
+            ],
+          };
+        }
+
+        // Dry run mode - show what would be updated
+        if (options.dryRun) {
+          const sampleDocs = await db.collection(collection).find(processedFilter).limit(3).toArray();
+          const smartWarning = getOperationWarning(matchCount, 'update');
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  dryRun: true,
+                  operation: 'updateMany',
+                  collection,
+                  wouldMatch: matchCount,
+                  sampleDocuments: sampleDocs,
+                  updateOperation: update,
+                  message: smartWarning
+                }, null, 2),
+              },
+            ],
+          };
+        }
+
+        // Actual execution
+        const result = await db.collection(collection).updateMany(processedFilter, update, {
+          upsert: options.upsert
+        });
+
+        const smartWarning = getOperationWarning(result.matchedCount, 'update');
 
         return {
           content: [
             {
               type: 'text',
-              text: `Matched: ${result.matchedCount}, Modified: ${result.modifiedCount}${result.upsertedCount ? `, Upserted: ${result.upsertedCount}` : ''}`,
+              text: `Matched: ${result.matchedCount}, Modified: ${result.modifiedCount}${result.upsertedCount ? `, Upserted: ${result.upsertedCount}` : ''}${smartWarning ? `\n${smartWarning}` : ''}`,
             },
           ],
         };
@@ -424,25 +587,28 @@ export function registerDocumentTools(server: McpServer, db: Db, mode: string): 
 
         const result = await db.collection(collection).findOneAndUpdate(processedFilter, update, mongoOptions);
 
-        let responseText: string;
-        if (result && result.value) {
-          responseText = JSON.stringify(result.value, null, 2);
-        } else if (result && result.lastErrorObject?.upserted) {
-          responseText = `New document created via upsert with _id: ${result.lastErrorObject.upserted}`;
-        } else if (options.upsert) {
-          responseText = 'New document created via upsert';
+        // MongoDB driver v6+ returns the document directly (or null)
+        // The document returned depends on returnDocument option: 'before' or 'after'
+        if (result) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(result, null, 2),
+              },
+            ],
+          };
         } else {
-          responseText = 'No document matched the query';
+          // No document was found (and no upsert occurred)
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'No document matched the query',
+              },
+            ],
+          };
         }
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: responseText,
-            },
-          ],
-        };
       } catch (error) {
         logError('findOneAndUpdate', error, args);
         const errorMessage = error instanceof Error ? error.message : String(error);
@@ -499,22 +665,85 @@ export function registerDocumentTools(server: McpServer, db: Db, mode: string): 
 
   registerTool(
     'deleteMany',
-    'Delete multiple documents that match the filter',
+    'Delete multiple documents that match the filter. Supports dryRun mode, empty filter protection, and maxDocuments limit.',
     {
       collection: z.string(),
       filter: z.record(z.any()),
+      options: z.object({
+        dryRun: z.boolean().optional(),
+        allowEmptyFilter: z.boolean().optional(),
+        maxDocuments: z.number().positive().optional(),
+      }).optional(),
     },
     async (args) => {
       logToolUsage('deleteMany', args);
-      const { collection, filter } = args;
+      const { collection, filter, options = {} } = args;
       try {
         const processedFilter = preprocessQuery(filter);
+
+        // Check for empty filter safety
+        const filterCheck = shouldBlockFilter(processedFilter, options.allowEmptyFilter, 'Delete');
+        if (filterCheck.blocked) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: filterCheck.reason,
+              },
+            ],
+          };
+        }
+
+        // Count documents that would be affected
+        const deleteCount = await db.collection(collection).countDocuments(processedFilter);
+
+        // Check maxDocuments limit
+        if (options.maxDocuments && deleteCount > options.maxDocuments) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `⚠ Operation blocked: Would delete ${deleteCount.toLocaleString()} documents, exceeds maxDocuments limit of ${options.maxDocuments.toLocaleString()}
+
+Use previewDelete() to see which documents would be deleted
+Or increase maxDocuments limit if this is intentional`,
+              },
+            ],
+          };
+        }
+
+        // Dry run mode - show what would be deleted
+        if (options.dryRun) {
+          const sampleDocs = await db.collection(collection).find(processedFilter).limit(3).toArray();
+          const smartWarning = getOperationWarning(deleteCount, 'delete');
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  dryRun: true,
+                  operation: 'deleteMany',
+                  collection,
+                  wouldDelete: deleteCount,
+                  sampleDocuments: sampleDocs,
+                  message: smartWarning
+                }, null, 2),
+              },
+            ],
+          };
+        }
+
+        // Actual execution
         const result = await db.collection(collection).deleteMany(processedFilter);
+
+        const smartWarning = getOperationWarning(result.deletedCount, 'delete');
+
         return {
           content: [
             {
               type: 'text',
-              text: `${result.deletedCount} document(s) deleted.`,
+              text: `${result.deletedCount} document(s) deleted.${smartWarning ? `\n${smartWarning}` : ''}`,
             },
           ],
         };

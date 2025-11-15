@@ -69,20 +69,62 @@ export function registerCollectionTools(server: McpServer, db: Db, mode: string)
 
   registerTool(
     'dropCollection',
-    'Drop a collection from the database',
+    'Drop a collection from the database. DESTRUCTIVE: Requires confirm: true to execute.',
     {
       name: z.string(),
+      confirm: z.boolean().optional(),
+      dryRun: z.boolean().optional(),
     },
     async (args) => {
       logToolUsage('dropCollection', args);
-      const { name } = args;
+      const { name, confirm = false, dryRun = false } = args;
       try {
+        // Get collection stats for preview
+        let stats;
+        try {
+          stats = await db.command({ collStats: name });
+        } catch {
+          stats = null;
+        }
+
+        // Dry run mode - show what would be dropped
+        if (dryRun) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  dryRun: true,
+                  operation: 'dropCollection',
+                  collection: name,
+                  exists: stats !== null,
+                  documentCount: stats?.count || 0,
+                  sizeBytes: stats?.size || 0,
+                  warning: '⚠ This operation will permanently delete all documents and indexes in this collection'
+                }, null, 2),
+              },
+            ],
+          };
+        }
+
+        // Require explicit confirmation
+        if (!confirm) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Operation blocked: dropCollection is destructive and requires explicit confirmation. Set confirm: true to proceed. Collection '${name}' has ${stats?.count || 0} documents.`,
+              },
+            ],
+          };
+        }
+
         const result = await db.collection(name).drop();
         return {
           content: [
             {
               type: 'text',
-              text: result ? `Collection '${name}' dropped successfully.` : `Failed to drop collection '${name}'.`,
+              text: result ? `Collection '${name}' dropped successfully. ${stats?.count || 0} documents deleted.` : `Failed to drop collection '${name}'.`,
             },
           ],
         };
