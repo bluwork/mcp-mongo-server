@@ -555,6 +555,862 @@ export function registerDataQualityTools(server: McpServer, db: Db, mode: string
       }
     }
   );
+
+  registerTool(
+    'findMissingFields',
+    'Check which documents are missing specified required fields. Useful for schema validation before migrations.',
+    {
+      collection: z.string(),
+      requiredFields: z.array(z.string()),
+      options: z.object({
+        filter: z.record(z.any()).optional(),
+        sampleSize: z.number().positive().optional(),
+        includeDocuments: z.boolean().optional(),
+      }).optional(),
+    },
+    async (args) => {
+      logToolUsage('findMissingFields', args);
+      const { collection, requiredFields, options = {} } = args;
+      const { filter = {}, sampleSize, includeDocuments = true } = options;
+
+      try {
+        const processedFilter = preprocessQuery(filter);
+        const collectionObj = db.collection(collection);
+
+        // Get total documents to check
+        const totalDocuments = sampleSize
+          ? Math.min(sampleSize, await collectionObj.countDocuments(processedFilter))
+          : await collectionObj.countDocuments(processedFilter);
+
+        if (totalDocuments === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  collection,
+                  message: 'No documents found matching filter',
+                }, null, 2),
+              },
+            ],
+          };
+        }
+
+        const missingFieldCounts: Record<string, any> = {};
+
+        // Check each field
+        for (const field of requiredFields) {
+          const missingFilter = {
+            ...processedFilter,
+            [field]: { $exists: false },
+          };
+
+          const missingCount = await collectionObj.countDocuments(missingFilter);
+
+          missingFieldCounts[field] = {
+            missing: missingCount,
+            percentage: parseFloat(((missingCount / totalDocuments) * 100).toFixed(2)),
+          };
+
+          // Get sample documents if requested
+          if (includeDocuments && missingCount > 0) {
+            const samples = await collectionObj
+              .find(missingFilter)
+              .limit(3)
+              .toArray();
+
+            missingFieldCounts[field].sampleDocuments = samples;
+          }
+        }
+
+        // Calculate statistics
+        const documentsMissingAnyField = await collectionObj.countDocuments({
+          ...processedFilter,
+          $or: requiredFields.map((field: string) => ({ [field]: { $exists: false } })),
+        });
+
+        const documentsComplete = totalDocuments - documentsMissingAnyField;
+        const completionRate = parseFloat((documentsComplete / totalDocuments).toFixed(4));
+
+        // Generate recommendations
+        const recommendations: string[] = [];
+
+        Object.entries(missingFieldCounts).forEach(([field, stats]) => {
+          if (stats.percentage > 50) {
+            recommendations.push(
+              `⚠ Field '${field}' missing in ${stats.percentage}% of documents - consider making it optional or running migration`
+            );
+          } else if (stats.percentage > 10) {
+            recommendations.push(
+              `Field '${field}' missing in ${stats.missing} documents - use updateMany to set default values`
+            );
+          } else if (stats.missing > 0 && stats.percentage < 1) {
+            recommendations.push(
+              `Field '${field}' missing in ${stats.missing} documents - investigate and fix individually`
+            );
+          }
+        });
+
+        if (completionRate === 1.0) {
+          recommendations.push('✓ All documents have all required fields');
+        }
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  collection,
+                  totalDocuments,
+                  requiredFields,
+                  missingFieldCounts,
+                  documentsMissingAnyField,
+                  documentsComplete,
+                  completionRate,
+                  recommendations,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (error) {
+        logError('findMissingFields', error, args);
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Error finding missing fields: ${errorMessage}`,
+            },
+          ],
+        };
+      }
+    }
+  );
+
+  registerTool(
+    'findInconsistentTypes',
+    'Detect type inconsistencies in a field across documents. Helps identify data quality issues.',
+    {
+      collection: z.string(),
+      field: z.string(),
+      options: z.object({
+        filter: z.record(z.any()).optional(),
+        sampleSize: z.number().positive().optional(),
+        includeSamples: z.boolean().optional(),
+        samplesPerType: z.number().positive().max(10).optional(),
+      }).optional(),
+    },
+    async (args) => {
+      logToolUsage('findInconsistentTypes', args);
+      const { collection, field, options = {} } = args;
+      const {
+        filter = {},
+        sampleSize,
+        includeSamples = true,
+        samplesPerType = 3,
+      } = options;
+
+      try {
+        const processedFilter = preprocessQuery(filter);
+        const collectionObj = db.collection(collection);
+
+        // Build aggregation pipeline
+        const pipeline: any[] = [{ $match: processedFilter }];
+
+        if (sampleSize) {
+          pipeline.push({ $limit: sampleSize });
+        }
+
+        // Determine type for each document
+        pipeline.push({
+          $project: {
+            fieldValue: `$${field}`,
+            fieldType: {
+              $switch: {
+                branches: [
+                  { case: { $eq: [{ $type: `$${field}` }, 'missing'] }, then: 'missing' },
+                  { case: { $eq: [{ $type: `$${field}` }, 'null'] }, then: 'null' },
+                  { case: { $isArray: `$${field}` }, then: 'array' },
+                  { case: { $eq: [{ $type: `$${field}` }, 'objectId'] }, then: 'ObjectId' },
+                  { case: { $eq: [{ $type: `$${field}` }, 'date'] }, then: 'Date' },
+                  { case: { $eq: [{ $type: `$${field}` }, 'bool'] }, then: 'boolean' },
+                  { case: { $eq: [{ $type: `$${field}` }, 'int'] }, then: 'number' },
+                  { case: { $eq: [{ $type: `$${field}` }, 'long'] }, then: 'number' },
+                  { case: { $eq: [{ $type: `$${field}` }, 'double'] }, then: 'number' },
+                  { case: { $eq: [{ $type: `$${field}` }, 'decimal'] }, then: 'number' },
+                  { case: { $eq: [{ $type: `$${field}` }, 'string'] }, then: 'string' },
+                  { case: { $eq: [{ $type: `$${field}` }, 'object'] }, then: 'object' },
+                ],
+                default: 'unknown',
+              },
+            },
+          },
+        });
+
+        // Group by type
+        pipeline.push({
+          $group: {
+            _id: '$fieldType',
+            count: { $sum: 1 },
+            samples: { $push: '$fieldValue' },
+          },
+        });
+
+        // Sort by count descending
+        pipeline.push({ $sort: { count: -1 } });
+
+        const results = await collectionObj.aggregate(pipeline).toArray();
+
+        if (results.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  collection,
+                  field,
+                  message: 'No documents found matching filter',
+                }, null, 2),
+              },
+            ],
+          };
+        }
+
+        // Calculate totals
+        const totalDocuments = results.reduce((sum, r) => sum + r.count, 0);
+
+        // Build type map
+        const types: Record<string, any> = {};
+        results.forEach(result => {
+          const typeName = result._id;
+          types[typeName] = {
+            count: result.count,
+            percentage: parseFloat(((result.count / totalDocuments) * 100).toFixed(2)),
+          };
+
+          if (includeSamples) {
+            types[typeName].samples = result.samples.slice(0, samplesPerType);
+          }
+        });
+
+        // Find dominant type
+        const dominantType = results[0]
+          ? {
+              type: results[0]._id,
+              count: results[0].count,
+              percentage: parseFloat(((results[0].count / totalDocuments) * 100).toFixed(2)),
+            }
+          : null;
+
+        const isConsistent = results.length === 1;
+
+        // Generate recommendations
+        const recommendations = generateTypeRecommendations(types, dominantType, field);
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  collection,
+                  field,
+                  totalDocuments,
+                  isConsistent,
+                  types,
+                  dominantType,
+                  recommendations,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (error) {
+        logError('findInconsistentTypes', error, args);
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Error finding type inconsistencies: ${errorMessage}`,
+            },
+          ],
+        };
+      }
+    }
+  );
+
+  registerTool(
+    'renameField',
+    'Rename a field across documents in a collection. Supports filtering, dry-run mode, and index migration.',
+    {
+      collection: z.string(),
+      oldFieldName: z.string(),
+      newFieldName: z.string(),
+      options: z.object({
+        filter: z.record(z.any()).optional(),
+        dryRun: z.boolean().optional(),
+        createIndex: z.boolean().optional(),
+        dropOldIndex: z.boolean().optional(),
+      }).optional(),
+    },
+    async (args) => {
+      logToolUsage('renameField', args);
+      const { collection, oldFieldName, newFieldName, options = {} } = args;
+      const {
+        filter = {},
+        dryRun = false,
+        createIndex = true,
+        dropOldIndex = false,
+      } = options;
+
+      try {
+        const warnings: string[] = [];
+        const collectionObj = db.collection(collection);
+
+        // Build filter that only matches documents with the old field
+        const renameFilter = {
+          ...preprocessQuery(filter),
+          [oldFieldName]: { $exists: true },
+        };
+
+        // Count affected documents
+        const affectedCount = await collectionObj.countDocuments(renameFilter);
+
+        if (affectedCount === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  documentsAffected: 0,
+                  message: `No documents found with field '${oldFieldName}'`,
+                  suggestion: 'Check field name spelling or use find() to verify data',
+                }, null, 2),
+              },
+            ],
+          };
+        }
+
+        // Dry run mode
+        if (dryRun) {
+          const samples = await collectionObj.find(renameFilter).limit(3).toArray();
+
+          const beforeAfter = samples.map(doc => {
+            const before = { ...doc };
+            const after = { ...doc };
+            after[newFieldName] = doc[oldFieldName];
+            delete after[oldFieldName];
+
+            return { before, after };
+          });
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(
+                  {
+                    dryRun: true,
+                    collection,
+                    oldFieldName,
+                    newFieldName,
+                    documentsAffected: affectedCount,
+                    samples: beforeAfter,
+                    estimatedTimeMs: Math.ceil(affectedCount / 1000) * 100,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+
+        // Check if new field already exists
+        const conflictCount = await collectionObj.countDocuments({
+          ...renameFilter,
+          [newFieldName]: { $exists: true },
+        });
+
+        if (conflictCount > 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Error: Field '${newFieldName}' already exists in ${conflictCount} documents\n\nSuggestion: Choose different name or manually resolve conflicts`,
+              },
+            ],
+          };
+        }
+
+        // Execute rename
+        const startTime = Date.now();
+
+        const result = await collectionObj.updateMany(renameFilter, {
+          $rename: { [oldFieldName]: newFieldName },
+        });
+
+        const executionTimeMs = Date.now() - startTime;
+
+        // Handle indexes
+        let indexesUpdated = 0;
+        if (createIndex) {
+          const indexes = await collectionObj.indexes();
+          const oldFieldIndexes = indexes.filter(idx =>
+            Object.keys(idx.key).includes(oldFieldName)
+          );
+
+          for (const oldIndex of oldFieldIndexes) {
+            // Skip if index doesn't have a name
+            if (!oldIndex.name) continue;
+
+            // Create new index with new field name
+            const newKey = { ...oldIndex.key };
+            newKey[newFieldName] = newKey[oldFieldName];
+            delete newKey[oldFieldName];
+
+            const indexOptions: any = {
+              name: oldIndex.name.replace(oldFieldName, newFieldName),
+            };
+
+            if (oldIndex.unique) indexOptions.unique = true;
+            if (oldIndex.sparse) indexOptions.sparse = true;
+
+            try {
+              await collectionObj.createIndex(newKey, indexOptions);
+              indexesUpdated++;
+
+              // Optionally drop old index
+              if (dropOldIndex) {
+                await collectionObj.dropIndex(oldIndex.name);
+              }
+            } catch (err) {
+              warnings.push(
+                `Failed to migrate index '${oldIndex.name}': ${err instanceof Error ? err.message : String(err)}`
+              );
+            }
+          }
+
+          if (indexesUpdated > 0 && !dropOldIndex) {
+            warnings.push(
+              `Created ${indexesUpdated} new indexes. Old indexes still exist - use dropOldIndex: true to remove them`
+            );
+          }
+        }
+
+        if (affectedCount > 100000) {
+          warnings.push('⚠ Large operation completed - consider running during off-peak hours for future migrations');
+        }
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  collection,
+                  oldFieldName,
+                  newFieldName,
+                  documentsAffected: result.modifiedCount,
+                  indexesUpdated,
+                  executionTimeMs,
+                  warnings: warnings.length > 0 ? warnings : undefined,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (error) {
+        logError('renameField', error, args);
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Error renaming field: ${errorMessage}`,
+            },
+          ],
+        };
+      }
+    },
+    true
+  );
+
+  registerTool(
+    'analyzeQueryPerformance',
+    'Analyze query performance using MongoDB explain plan. Identifies index usage, slow queries, and optimization opportunities.',
+    {
+      collection: z.string(),
+      query: z.object({
+        filter: z.record(z.any()).optional(),
+        sort: z.record(z.number()).optional(),
+        projection: z.record(z.any()).optional(),
+        limit: z.number().optional(),
+      }).optional(),
+      options: z.object({
+        verbosity: z.enum(['queryPlanner', 'executionStats', 'allPlansExecution']).optional(),
+        includeRecommendations: z.boolean().optional(),
+      }).optional(),
+    },
+    async (args) => {
+      logToolUsage('analyzeQueryPerformance', args);
+      const { collection, query = {}, options = {} } = args;
+      const {
+        filter = {},
+        sort,
+        projection,
+        limit,
+      } = query;
+      const {
+        verbosity = 'executionStats',
+        includeRecommendations = true,
+      } = options;
+
+      try {
+        const collectionObj = db.collection(collection);
+        const processedFilter = preprocessQuery(filter);
+
+        // Build query
+        let cursor = collectionObj.find(processedFilter);
+        if (projection) cursor = cursor.project(projection);
+        if (sort) cursor = cursor.sort(sort);
+        if (limit) cursor = cursor.limit(limit);
+
+        // Get explain output
+        const explain = await cursor.explain(verbosity);
+
+        // Extract key metrics based on verbosity level
+        const analysis: any = {
+          collection,
+          query: {
+            filter: processedFilter,
+            sort,
+            projection,
+            limit,
+          },
+        };
+
+        // Always available from queryPlanner
+        if (explain.queryPlanner) {
+          analysis.planSummary = {
+            namespace: explain.queryPlanner.namespace,
+            indexFilterSet: explain.queryPlanner.indexFilterSet || false,
+            winningPlan: simplifyPlanTree(explain.queryPlanner.winningPlan),
+          };
+        }
+
+        // Available from executionStats and allPlansExecution
+        if (explain.executionStats) {
+          const stats = explain.executionStats;
+          analysis.executionStats = {
+            executionTimeMs: stats.executionTimeMillis,
+            totalDocsExamined: stats.totalDocsExamined,
+            totalKeysExamined: stats.totalKeysExamined,
+            nReturned: stats.nReturned,
+            executionStages: simplifyExecutionStages(stats.executionStages),
+          };
+
+          // Calculate efficiency metrics
+          const selectivity = stats.nReturned > 0
+            ? (stats.totalDocsExamined / stats.nReturned).toFixed(2)
+            : 'N/A';
+
+          analysis.efficiency = {
+            indexUsed: stats.totalKeysExamined > 0,
+            selectivityRatio: selectivity,
+            isCollectionScan: stats.executionStages?.stage === 'COLLSCAN',
+          };
+
+          if (stats.allPlansExecution && verbosity === 'allPlansExecution') {
+            analysis.alternativePlans = stats.allPlansExecution.map((plan: any) => ({
+              planSummary: simplifyPlanTree(plan),
+            }));
+          }
+        }
+
+        // Get current indexes for context
+        const indexes = await collectionObj.indexes();
+        analysis.availableIndexes = indexes.map(idx => ({
+          name: idx.name,
+          key: idx.key,
+          unique: idx.unique || false,
+          sparse: idx.sparse || false,
+        }));
+
+        // Generate recommendations
+        if (includeRecommendations) {
+          analysis.recommendations = generatePerformanceRecommendations(
+            explain,
+            processedFilter,
+            sort
+          );
+        }
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(analysis, null, 2),
+            },
+          ],
+        };
+      } catch (error) {
+        logError('analyzeQueryPerformance', error, args);
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Error analyzing query performance: ${errorMessage}`,
+            },
+          ],
+        };
+      }
+    }
+  );
+
+  registerTool(
+    'findOrphans',
+    'Find orphaned documents where referenced IDs no longer exist in the target collection. Essential for maintaining referential integrity.',
+    {
+      collection: z.string(),
+      foreignKey: z.string(),
+      referenceCollection: z.string(),
+      options: z.object({
+        referenceField: z.string().optional(),
+        filter: z.record(z.any()).optional(),
+        limit: z.number().positive().max(1000).optional(),
+        includeDocuments: z.boolean().optional(),
+      }).optional(),
+    },
+    async (args) => {
+      logToolUsage('findOrphans', args);
+      const { collection, foreignKey, referenceCollection, options = {} } = args;
+      const {
+        referenceField = '_id',
+        filter = {},
+        limit = 100,
+        includeDocuments = true,
+      } = options;
+
+      try {
+        const collectionObj = db.collection(collection);
+
+        // Check if reference collection exists
+        const refCollections = await db.listCollections({ name: referenceCollection }).toArray();
+        if (refCollections.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  error: `Reference collection '${referenceCollection}' does not exist`,
+                  suggestion: 'Use listCollections() to see available collections',
+                }, null, 2),
+              },
+            ],
+          };
+        }
+
+        const processedFilter = preprocessQuery(filter);
+        const startTime = Date.now();
+
+        // Build aggregation pipeline to find orphans
+        const pipeline: any[] = [
+          {
+            $match: {
+              ...processedFilter,
+              [foreignKey]: { $exists: true, $ne: null },
+            },
+          },
+          {
+            $lookup: {
+              from: referenceCollection,
+              localField: foreignKey,
+              foreignField: referenceField,
+              as: 'referenced',
+            },
+          },
+          {
+            $match: {
+              referenced: { $size: 0 }, // No matching documents in reference collection
+            },
+          },
+          {
+            $limit: limit,
+          },
+        ];
+
+        if (!includeDocuments) {
+          pipeline.push({
+            $project: {
+              _id: 1,
+              [foreignKey]: 1,
+            },
+          });
+        } else {
+          pipeline.push({
+            $project: {
+              referenced: 0, // Remove the lookup result field
+            },
+          });
+        }
+
+        const orphans = await collectionObj.aggregate(pipeline).toArray();
+
+        // Count total orphans (without limit)
+        const countPipeline = pipeline.slice(0, -2); // Remove limit and project
+        countPipeline.push({ $count: 'total' });
+        const countResult = await collectionObj.aggregate(countPipeline).toArray();
+        const totalOrphans = countResult.length > 0 ? countResult[0].total : 0;
+
+        const executionTimeMs = Date.now() - startTime;
+
+        // Get collection stats
+        const totalDocuments = await collectionObj.countDocuments(processedFilter);
+        const orphanPercentage = totalDocuments > 0
+          ? parseFloat(((totalOrphans / totalDocuments) * 100).toFixed(2))
+          : 0;
+
+        // Generate recommendations
+        const recommendations: string[] = [];
+
+        if (totalOrphans === 0) {
+          recommendations.push('✓ No orphaned references found - referential integrity is maintained');
+        } else {
+          if (orphanPercentage > 10) {
+            recommendations.push(
+              `⚠ High orphan rate (${orphanPercentage}%) - consider implementing cascade delete or fixing data relationships`
+            );
+          }
+
+          if (totalOrphans < 100) {
+            recommendations.push(
+              `Found ${totalOrphans} orphaned documents - use deleteMany or updateMany to clean up`
+            );
+          } else {
+            recommendations.push(
+              `Found ${totalOrphans} orphaned documents - implement batch cleanup process for safe removal`
+            );
+          }
+
+          recommendations.push(
+            `Consider adding validation or triggers to prevent orphaned references in future`
+          );
+        }
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  collection,
+                  foreignKey,
+                  referenceCollection,
+                  referenceField,
+                  totalOrphans,
+                  orphansReturned: orphans.length,
+                  statistics: {
+                    totalDocuments,
+                    orphanedDocuments: totalOrphans,
+                    orphanPercentage,
+                  },
+                  orphans: includeDocuments ? orphans : orphans.map(o => ({ _id: o._id, [foreignKey]: o[foreignKey] })),
+                  executionTimeMs,
+                  recommendations,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (error) {
+        logError('findOrphans', error, args);
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Error finding orphans: ${errorMessage}`,
+            },
+          ],
+        };
+      }
+    }
+  );
+}
+
+// Helper function to generate type consistency recommendations
+function generateTypeRecommendations(
+  types: Record<string, any>,
+  dominantType: any,
+  field: string
+): string[] {
+  const recommendations: string[] = [];
+  const typeNames = Object.keys(types);
+
+  if (typeNames.length === 1) {
+    recommendations.push(`✓ Field '${field}' has consistent type: ${typeNames[0]}`);
+    return recommendations;
+  }
+
+  // Multiple types detected
+  recommendations.push(`⚠ Field '${field}' has ${typeNames.length} different types`);
+
+  // Check for common issues
+  if (types.string && types.number) {
+    const stringPct = types.string.percentage;
+    const numberPct = types.number.percentage;
+
+    if (stringPct < numberPct) {
+      recommendations.push(
+        `Convert ${types.string.count} string values to numbers using updateMany with $toDouble`
+      );
+    } else {
+      recommendations.push(
+        `Consider standardizing to string or investigate why ${types.number.count} docs have numbers`
+      );
+    }
+  }
+
+  if (types.missing) {
+    recommendations.push(
+      `${types.missing.count} documents missing field '${field}' - consider setting default value or making field optional`
+    );
+  }
+
+  if (types.null) {
+    recommendations.push(
+      `${types.null.count} documents have null value - determine if intentional or should be removed`
+    );
+  }
+
+  if (types.array && (types.string || types.number)) {
+    recommendations.push(
+      '⚠ Mix of scalar and array values - this will cause query issues. Normalize to consistent structure'
+    );
+  }
+
+  // Suggest dominant type conversion
+  if (dominantType && dominantType.percentage > 80) {
+    const minorityTypes = typeNames.filter(t => t !== dominantType.type);
+    recommendations.push(
+      `Dominant type is ${dominantType.type} (${dominantType.percentage}%). Consider converting ${minorityTypes.join(', ')} to ${dominantType.type}`
+    );
+  }
+
+  return recommendations;
 }
 
 // Helper function to flatten nested objects for CSV export
@@ -583,4 +1439,152 @@ function flattenObject(obj: any, prefix = ''): Record<string, any> {
   }
 
   return flattened;
+}
+
+// Helper function to simplify explain plan tree for readability
+function simplifyPlanTree(plan: any): any {
+  if (!plan) return null;
+
+  const simplified: any = {
+    stage: plan.stage,
+  };
+
+  // Include relevant fields based on stage type
+  if (plan.indexName) simplified.indexName = plan.indexName;
+  if (plan.direction) simplified.direction = plan.direction;
+  if (plan.indexBounds) simplified.indexBounds = plan.indexBounds;
+  if (plan.filter) simplified.filter = plan.filter;
+
+  // Recursively simplify input stages
+  if (plan.inputStage) {
+    simplified.inputStage = simplifyPlanTree(plan.inputStage);
+  }
+  if (plan.inputStages) {
+    simplified.inputStages = plan.inputStages.map((stage: any) => simplifyPlanTree(stage));
+  }
+
+  return simplified;
+}
+
+// Helper function to simplify execution stages
+function simplifyExecutionStages(stages: any): any {
+  if (!stages) return null;
+
+  const simplified: any = {
+    stage: stages.stage,
+  };
+
+  // Include execution metrics
+  if (stages.nReturned !== undefined) simplified.nReturned = stages.nReturned;
+  if (stages.executionTimeMillisEstimate !== undefined) {
+    simplified.executionTimeMillisEstimate = stages.executionTimeMillisEstimate;
+  }
+  if (stages.works !== undefined) simplified.works = stages.works;
+  if (stages.advanced !== undefined) simplified.advanced = stages.advanced;
+  if (stages.docsExamined !== undefined) simplified.docsExamined = stages.docsExamined;
+
+  // Stage-specific fields
+  if (stages.indexName) simplified.indexName = stages.indexName;
+  if (stages.keysExamined !== undefined) simplified.keysExamined = stages.keysExamined;
+  if (stages.seeks !== undefined) simplified.seeks = stages.seeks;
+
+  // Recursively simplify input stages
+  if (stages.inputStage) {
+    simplified.inputStage = simplifyExecutionStages(stages.inputStage);
+  }
+  if (stages.inputStages) {
+    simplified.inputStages = stages.inputStages.map((stage: any) => simplifyExecutionStages(stage));
+  }
+
+  return simplified;
+}
+
+// Helper function to generate performance recommendations
+function generatePerformanceRecommendations(
+  explain: any,
+  filter: any,
+  sort: any
+): string[] {
+  const recommendations: string[] = [];
+
+  if (!explain.executionStats) {
+    recommendations.push('Run with verbosity "executionStats" or "allPlansExecution" for detailed recommendations');
+    return recommendations;
+  }
+
+  const stats = explain.executionStats;
+  const isCollectionScan = stats.executionStages?.stage === 'COLLSCAN';
+  const totalDocsExamined = stats.totalDocsExamined || 0;
+  const totalKeysExamined = stats.totalKeysExamined || 0;
+  const nReturned = stats.nReturned || 0;
+  const executionTimeMs = stats.executionTimeMillis || 0;
+
+  // Check for collection scan
+  if (isCollectionScan) {
+    const filterFields = Object.keys(filter);
+    if (filterFields.length > 0) {
+      recommendations.push(
+        `⚠ COLLSCAN detected - create index on: ${filterFields.join(', ')}`
+      );
+
+      // Suggest compound index if there's a sort
+      if (sort) {
+        const sortFields = Object.keys(sort);
+        const suggestedIndex = [...filterFields, ...sortFields].join(', ');
+        recommendations.push(
+          `Consider compound index: {${suggestedIndex}} for optimal performance`
+        );
+      }
+    } else {
+      recommendations.push('⚠ Full collection scan - consider adding filter criteria or index');
+    }
+  }
+
+  // Check selectivity ratio
+  if (nReturned > 0 && totalDocsExamined > 0) {
+    const selectivityRatio = totalDocsExamined / nReturned;
+    if (selectivityRatio > 10) {
+      recommendations.push(
+        `⚠ Poor selectivity ratio (${selectivityRatio.toFixed(1)}:1) - index not selective enough or missing`
+      );
+    } else if (selectivityRatio > 3 && selectivityRatio <= 10) {
+      recommendations.push(
+        `Index selectivity could be improved (examining ${selectivityRatio.toFixed(1)}x more docs than returned)`
+      );
+    } else if (selectivityRatio <= 1.2) {
+      recommendations.push('✓ Excellent index selectivity');
+    }
+  }
+
+  // Check execution time
+  if (executionTimeMs > 1000) {
+    recommendations.push(`⚠ Slow query (${executionTimeMs}ms) - optimization needed`);
+  } else if (executionTimeMs > 100) {
+    recommendations.push(`Query took ${executionTimeMs}ms - consider optimization if frequently executed`);
+  } else if (executionTimeMs < 10) {
+    recommendations.push(`✓ Fast query execution (${executionTimeMs}ms)`);
+  }
+
+  // Check if index is covering query
+  if (totalDocsExamined === 0 && totalKeysExamined > 0 && nReturned > 0) {
+    recommendations.push('✓ Covered query - all data served from index');
+  }
+
+  // Check for index usage on sort
+  if (sort && !isCollectionScan) {
+    const sortInMemory = stats.executionStages?.inputStage?.stage === 'SORT' ||
+                         stats.executionStages?.stage === 'SORT';
+    if (sortInMemory) {
+      recommendations.push(
+        `⚠ In-memory sort detected - consider index on: ${Object.keys(sort).join(', ')}`
+      );
+    }
+  }
+
+  // General recommendations
+  if (recommendations.length === 0) {
+    recommendations.push('✓ Query performance looks good');
+  }
+
+  return recommendations;
 }
