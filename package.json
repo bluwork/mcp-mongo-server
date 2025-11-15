@@ -28,7 +28,6 @@
   "license": "ISC",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.21.1",
-    "dotenv": "^16.6.1",
     "mongodb": "^6.20.0",
     "zod": "^3.25.76"
   },

@@ -1,13 +1,10 @@
-import { config } from 'dotenv';
 import type { AppConfig } from '../types.js';
-
-config();
 
 export function parseArgs(): AppConfig {
   const args = process.argv.slice(2);
-  let uri = process.env.MONGODB_URI || 'mongodb://localhost:27017';
-  let dbName = process.env.MONGODB_DB || 'test';
-  let mode = process.env.SERVER_MODE || 'read-only';
+  let uri: string | undefined;
+  let dbName: string | undefined;
+  let mode = 'read-only';
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -17,14 +14,15 @@ export function parseArgs(): AppConfig {
       mode = 'read-write';
     } else if (arg === '--mode' && i + 1 < args.length) {
       mode = args[++i];
-    } else if (!uri || uri === 'mongodb://localhost:27017') {
+    } else if (!uri) {
       uri = arg;
-    } else if (!dbName || dbName === 'test') {
+    } else if (!dbName) {
       dbName = arg;
     }
   }
 
-  const logDir = process.env.LOG_DIR || './logs';
+  uri = uri || 'mongodb://localhost:27017';
+  dbName = dbName || 'test';
 
-  return { uri, dbName, mode, logDir };
+  return { uri, dbName, mode, logDir: './logs' };
 }
